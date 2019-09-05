@@ -1,5 +1,6 @@
 import sublime
 import sublime_plugin
+import fnmatch
 import json
 import os
 import re
@@ -46,6 +47,28 @@ def clean_path(path):
 assert clean_path('/foo/./bar') == '/foo/bar'
 assert clean_path('/foo/../bar') == '/bar'
 
+def resolve_relative_path(path1, path2):
+  longest_common = 0
+  segments1 = list(filter(lambda string: string != '', re.split(r'/', path1)))
+  segments2 = list(filter(lambda string: string != '', re.split(r'/', path2)))
+  longest_common = 0
+  for index, segment in enumerate(segments1):
+    if segments2[index] != segment:
+      break
+    longest_common += 1
+  segments1 = segments1[longest_common:]
+  segments2 = segments2[longest_common:]
+  if len(segments1) == 0:
+    return './' + '/'.join(segments2)
+  else:
+    parents = ['..'] * len(segments1)
+    return '/'.join(parents) + '/' + '/'.join(segments2)
+
+assert resolve_relative_path('/foobar/test', '/foobar/test/asd.js') == './asd.js'
+assert resolve_relative_path('/foobar/test', '/foobar/src/asd.js') == '../src/asd.js'
+assert resolve_relative_path('/', '/foobar/test.js') == './foobar/test.js'
+assert resolve_relative_path('/foo', '/foo/foobar/test.js') == './foobar/test.js'
+
 def resolve_js_file_path(path):
   variations = [path]
   if not path.endswith('.js'):
@@ -57,11 +80,35 @@ def resolve_js_file_path(path):
       return variation
   return None
 
+def find_package_root(dirname):
+  counter = 0
+  while dirname != '/' and counter < 20:
+    if os.path.isfile(os.path.join(dirname, 'package.json')):
+      return dirname
+    counter += 1
+    dirname = os.path.dirname(dirname)
+
+def should_do_autocomplete(line_until_cursor):
+  if re.match(r'.*\brequire\s*\([\'"]\w', line_until_cursor):
+    return True
+  if re.match(r'.*\bfrom\s* [\'"]\w', line_until_cursor):
+    return True
+  return False
+
+assert should_do_autocomplete('') == False
+assert should_do_autocomplete('foo') == False
+assert should_do_autocomplete('require') == False
+assert should_do_autocomplete('from') == False
+assert should_do_autocomplete('var asd = require("a') == True
+assert should_do_autocomplete('var asd = require(\'a') == True
+assert should_do_autocomplete('import asd from "a') == True
+assert should_do_autocomplete('import asd from \'a') == True
+
 #
 # Main
 #
 
-class HoverListener(sublime_plugin.EventListener):
+class JsImportResolveListener(sublime_plugin.EventListener):
   def on_hover(self, view, point, hover_zone):
     line = view.substr(view.line(point))
     values = extract_import_values(line)
@@ -75,18 +122,40 @@ class HoverListener(sublime_plugin.EventListener):
             break
         else:
           dirname = os.path.dirname(view.file_name())
-          counter = 0
-          while dirname != '/' and counter < 20:
-            if os.path.isdir(os.path.join(dirname, 'node_modules')):
-              module_path = os.path.join(dirname, 'node_modules', value)
-              if os.path.isdir(module_path):
-                with open(os.path.join(module_path, 'package.json'), 'r') as file:
-                  package_information = json.loads(file.read())
-                  if package_information['main']:
-                    file_path = resolve_js_file_path(clean_path(os.path.join(module_path, package_information['main'])))
-                    paths.append(file_path)
-              break
-            counter += 1
-            dirname = os.path.dirname(dirname)
+          package_root = find_package_root(dirname)
+          module_path = os.path.join(package_root, 'node_modules', value)
+          if os.path.isdir(module_path):
+            with open(os.path.join(module_path, 'package.json'), 'r') as file:
+              package_information = json.loads(file.read())
+              if package_information['main']:
+                file_path = resolve_js_file_path(clean_path(os.path.join(module_path, package_information['main'])))
+                paths.append(file_path)
       html = '<br>'.join(map(lambda path: '<a href="' + path + '">' + path + '</a>', paths))
       view.show_popup(html, sublime.HIDE_ON_MOUSE_MOVE_AWAY, point, 1000, 1000, lambda href: view.window().open_file(href))
+
+  def on_query_completions(self, view, prefix, locations):
+    location = locations[0]
+    line_until_cursor = view.substr(sublime.Region(view.line(location).begin(), location))
+    if should_do_autocomplete(line_until_cursor):
+      files = []
+      dirname = os.path.dirname(view.file_name())
+      package_root = find_package_root(dirname)
+      # read package.json for dependencies
+      with open(os.path.join(package_root, 'package.json'), 'r') as file:
+        package_information = json.loads(file.read())
+        if 'dependencies' in package_information:
+          for dependency_name in package_information['dependencies']:
+            if dependency_name.startswith(prefix):
+              files.append((dependency_name + '\t' + 'package.json', dependency_name))
+        if 'devDependencies' in package_information:
+          for dependency_name in package_information['devDependencies']:
+            if dependency_name.startswith(prefix):
+              files.append((dependency_name + '\t' + 'package.json', dependency_name))
+      # find project JS-files recursively https://stackoverflow.com/a/2186565/239527
+      for root, dirnames, filenames in os.walk(package_root):
+        for filename in fnmatch.filter(filenames, prefix + '*.js'):
+          if '/node_modules/' not in root:
+            absolute_path = os.path.join(root, filename)
+            relative_path = resolve_relative_path(dirname, absolute_path)
+            files.append((filename + '\t' + relative_path, relative_path))
+      return files
